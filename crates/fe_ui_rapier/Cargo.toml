@@ -1,0 +1,12 @@
+[package]
+name        = "fe_ui_rapier"
+version     = "0.1.0-alpha"
+edition     = "2021"
+description = "Rapier2D physics integration for Ferrum fe_ui"
+license     = "MIT OR Apache-2.0"
+
+[dependencies]
+fe_ui_core = { path = "../fe_ui_core" }
+rapier2d   = { workspace = true }
+log        = { workspace = true }
+glam       = { workspace = true }

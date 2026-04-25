@@ -1,0 +1,4 @@
+/target
+.ferrum/
+**/*.fe.rs          # transpiled output (future)
+Cargo.lock          # omit for libraries; keep for binaries

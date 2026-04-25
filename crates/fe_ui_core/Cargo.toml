@@ -1,0 +1,12 @@
+[package]
+name        = "fe_ui_core"
+version     = "0.1.0-alpha"
+edition     = "2021"
+description = "Core types, signals, and the Ghost ECS for Ferrum fe_ui. No GPU. No physics. No layout engine."
+license     = "MIT OR Apache-2.0"
+
+[dependencies]
+log       = { workspace = true }
+thiserror = { workspace = true }
+slotmap   = { workspace = true }
+glam      = { workspace = true }

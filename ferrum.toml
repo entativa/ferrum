@@ -1,0 +1,28 @@
+# ferrum.toml — hot-reloaded in debug builds
+# Change these values while the app is running to tweak physics live.
+
+[physics]
+gravity         = [0.0, 980.0]   # pixels/s²  (100 px = 1 m)
+air_density     = 0.1
+pixels_per_meter = 100.0
+
+[simulation]
+physics_hz        = 240.0
+substeps          = 4
+solver_iterations = 8
+
+[spring]
+stiffness = 150.0
+damping   = 15.0
+mass      = 1.0
+
+[renderer]
+clear_color  = "#0a0a0a"
+msaa_samples = 4
+vsync        = true
+
+[motion_blur]
+enabled      = false
+threshold    = 200.0   # px/s
+max_stretch  = 24.0    # px
+samples      = 4

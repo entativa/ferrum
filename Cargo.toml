@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fe_ui_core",
+    "crates/fe_ui_taffy",
+    "crates/fe_ui_rapier",
+    "crates/fe_ui_wgpu",
+    "crates/fe_ui",
+    "crates/fe_std",
+]
+
+[workspace.dependencies]
+# Core
+log        = "0.4"
+thiserror  = "1"
+slotmap    = "1"
+
+# Layout
+taffy = "0.4"
+
+# Physics
+rapier2d = { version = "0.18", features = ["enhanced-determinism"] }
+
+# Rendering
+wgpu     = "0.20"
+winit    = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Text
+cosmic-text = "0.11"
+
+# Math
+glam = "0.27"
+
+# Accessibility
+accesskit = "0.16"
+
+[profile.dev]
+opt-level = 1          # faster incremental builds
+
+[profile.release]
+lto       = "thin"
+opt-level = 3
+strip     = true

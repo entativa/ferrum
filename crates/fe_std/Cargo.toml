@@ -1,0 +1,9 @@
+[package]
+name        = "fe_std"
+version     = "0.1.0-alpha"
+edition     = "2021"
+description = "Standard physics-tuned component library for Ferrum fe_ui"
+license     = "MIT OR Apache-2.0"
+
+[dependencies]
+fe_ui = { path = "../fe_ui" }

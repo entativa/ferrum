@@ -1,0 +1,16 @@
+[package]
+name        = "fe_ui"
+version     = "0.1.0-alpha"
+edition     = "2021"
+description = "Ferrum fe_ui — GPU-accelerated Rust UI framework with physics-native layout"
+license     = "MIT OR Apache-2.0"
+
+[dependencies]
+fe_ui_core   = { path = "../fe_ui_core" }
+fe_ui_taffy  = { path = "../fe_ui_taffy" }
+fe_ui_rapier = { path = "../fe_ui_rapier" }
+fe_ui_wgpu   = { path = "../fe_ui_wgpu" }
+
+winit     = { workspace = true }
+log       = { workspace = true }
+accesskit = { workspace = true }
