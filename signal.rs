@@ -633,7 +633,7 @@ impl SignalGraph {
     /// Clears the dirty set — each entity appears at most once.
     pub fn take_layout_dirty(&mut self) -> Vec<crate::entity::EntityId> {
         let mut entities: Vec<_> = self.dirty_layout.values().copied().collect();
-        entities.sort_unstable_by_key(|e| e.0); // deterministic order
+        entities.sort_unstable(); // deterministic order
         // Deduplicate — multiple layout signals on the same entity
         entities.dedup();
         self.dirty_layout.clear();
@@ -878,9 +878,9 @@ mod tests {
 
     fn make_scope() -> Scope {
         use crate::entity::EntityId;
+        use slotmap::SlotMap;
 
         // Create a minimal SlotMap to get a valid EntityId
-        new_key_type! { }
         let graph     = Rc::new(RefCell::new(SignalGraph::new()));
         let mut store: SlotMap<EntityId, ()> = SlotMap::with_key();
         let entity_id = store.insert(());

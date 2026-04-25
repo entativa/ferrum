@@ -1,6 +1,5 @@
 //! types.rs — Shared primitive types used across all Ferrum crates.
 
-use glam::Vec2 as GlamVec2;
 
 pub use glam::Vec2;
 
