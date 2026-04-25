@@ -878,9 +878,9 @@ mod tests {
 
     fn make_scope() -> Scope {
         use crate::entity::EntityId;
+        use slotmap::SlotMap;
 
         // Create a minimal SlotMap to get a valid EntityId
-        new_key_type! { }
         let graph     = Rc::new(RefCell::new(SignalGraph::new()));
         let mut store: SlotMap<EntityId, ()> = SlotMap::with_key();
         let entity_id = store.insert(());
