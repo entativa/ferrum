@@ -624,11 +624,15 @@ impl SignalGraph {
     /// Step 1 of the Sync Point: drain all queued .queue() writes.
     /// These are writes from physics event handlers deferred to this frame.
     pub fn drain_physics_queue(&mut self) {
-        while let Some(write) = self.write_queue.pop_front() {
-            write();
-        }
+    // Drain the whole queue into a local vec first.
+    // This drops the &mut self borrow before any closure runs,
+    // preventing a RefCell double-borrow when a closure tries
+    // to borrow the graph (e.g. to mark layout dirty).
+    let writes: Vec<_> = self.write_queue.drain(..).collect();
+    for write in writes {
+        write();
     }
-
+    }
     /// Step 3 of the Sync Point: collect all dirty layout entity IDs.
     /// Clears the dirty set — each entity appears at most once.
     pub fn take_layout_dirty(&mut self) -> Vec<crate::entity::EntityId> {
