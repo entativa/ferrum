@@ -31,7 +31,7 @@ impl LayoutRect {
 
 /// The output of Rapier physics simulation.
 /// Consumed by fe_ui_wgpu after interpolation.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transform2D {
     pub position: Vec2,
     pub rotation: f32,   // radians

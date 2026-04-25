@@ -14,7 +14,7 @@ pub mod signal;
 pub mod style;
 pub mod types;
 
-pub use entity::{EntityId, GhostWorld};
+pub use entity::EntityId;
 pub use physics::PhysicsState;
 pub use signal::{Signal, use_signal, use_layout_signal, use_derived};
 pub use types::{LayoutRect, Transform2D, Color, Vec2, Bounds};

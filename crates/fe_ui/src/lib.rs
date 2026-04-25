@@ -8,8 +8,8 @@ pub mod sync;
 pub mod window;
 
 pub mod prelude {
-    pub use crate::app::App;
-    pub use crate::window::Window;
+  // pub use crate::app::App;
+  // pub use crate::window::Window;
     pub use fe_ui_core::{
         entity::EntityId,
         physics::{PhysicsProps, PhysicsState, Stiffness, BodyType, InteractionClass},

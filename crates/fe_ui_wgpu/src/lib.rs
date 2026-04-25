@@ -8,4 +8,4 @@ pub mod portal;
 pub mod renderer;
 pub mod text;
 
-pub use renderer::Renderer;
+// pub use renderer::Renderer;
