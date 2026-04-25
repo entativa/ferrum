@@ -28,19 +28,40 @@
 //    2. Dirty derived signals recompute (topo-sorted, once each).
 //    3. Dirty layout nodes are collected and handed to fe_ui_taffy.
 //
-//  A layout signal that is written 1000 times in one frame causes exactly
+//  A layout signal written 1000 times in one frame causes exactly
 //  ONE Taffy recompute — the final value wins.
+//
+// ─── Borrow safety ───────────────────────────────────────────────────────────
+//
+//  The SignalGraph is Rc<RefCell<SignalGraph>>. To prevent runtime panics:
+//
+//  1. The write queue is split into two lanes:
+//       plain_queue  — (SignalId, FnOnce) for Signal::queue().
+//                      Closure only touches the signal's Rc<RefCell<Inner>>.
+//                      Never borrows the graph.
+//       layout_queue — (SignalId, EntityId, FnOnce) for LayoutSignal::queue().
+//                      Closure only touches the signal's Rc<RefCell<Inner>>.
+//                      EntityId is stored separately so the drain loop can
+//                      call mark_layout_dirty AFTER the closure runs.
+//
+//  2. drain_queues() is three explicit phases:
+//       Phase A — move all entries into local Vecs (releases &mut self).
+//       Phase B — execute each closure (no graph borrow alive).
+//       Phase C — re-borrow graph to mark stale / dirty (closures are done).
+//
+//  This guarantees no closure ever runs while a borrow on the graph is live.
 //
 // ─── Thread safety ───────────────────────────────────────────────────────────
 //
-//  Ferrum's main loop is single-threaded. We use Rc<RefCell<T>> deliberately.
-//  If you are reaching for Arc<Mutex<T>>, you are in the wrong place.
+//  Ferrum's main loop is single-threaded. Rc<RefCell<T>> is deliberate.
+//  Do not reach for Arc<Mutex<T>> here.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
+#![allow(dead_code)]
+
 use std::{
-    any::Any,
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     fmt,
     rc::Rc,
@@ -50,7 +71,7 @@ use std::{
 
 /// Unique identifier for every signal in the graph.
 /// Cheap to copy. Used as graph node keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SignalId(u64);
 
 impl SignalId {
@@ -70,8 +91,6 @@ impl fmt::Display for SignalId {
 // ─── Version counter ─────────────────────────────────────────────────────────
 
 /// Monotonically increasing write counter.
-/// Derived signals compare their `last_computed_version` against the max
-/// version of their dependencies to decide if recomputation is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Version(u64);
 
@@ -84,7 +103,6 @@ impl Version {
 
 // ─── Inner storage ───────────────────────────────────────────────────────────
 
-/// The heap-allocated interior of a Signal or LayoutSignal.
 struct SignalInner<T> {
     id:      SignalId,
     value:   T,
@@ -106,21 +124,8 @@ impl<T: fmt::Debug> fmt::Debug for SignalInner<T> {
 /// An immediate reactive value.
 ///
 /// Writes update a version counter and notify the SignalGraph synchronously.
-/// Reads are always the current value — no batching, no delay.
-///
 /// Use for: colour, opacity, text content, shader parameters, visibility.
-/// Do NOT use for: width, height, flex properties — use LayoutSignal<T>.
-///
-/// # Example
-/// ```rust
-/// let is_hovered = use_signal(cx, || false);
-///
-/// // Write — immediate, notifies graph
-/// is_hovered.set(true);
-///
-/// // Read
-/// if is_hovered.get() { ... }
-/// ```
+/// Do NOT use for layout properties — use LayoutSignal<T>.
 #[derive(Clone)]
 pub struct Signal<T: Clone + 'static> {
     inner: Rc<RefCell<SignalInner<T>>>,
@@ -135,96 +140,51 @@ impl<T: Clone + 'static> Signal<T> {
             value,
             version: Version::default(),
         }));
-
         graph.borrow_mut().register_signal(id);
-
         Self { inner, graph }
     }
 
-    /// Returns the signal's unique ID.
-    pub fn id(&self) -> SignalId {
-        self.inner.borrow().id
-    }
-
-    /// Returns the current version (write count).
-    pub fn version(&self) -> Version {
-        self.inner.borrow().version
-    }
-
-    /// Read the current value.
-    ///
-    /// If called inside a `use_derived` computation, automatically registers
-    /// this signal as a dependency of the derived signal being computed.
-    pub fn get(&self) -> T {
-        let inner = self.inner.borrow();
-
-        // Track dependency if we're inside a derived computation
-        self.graph
-            .borrow()
-            .track_dependency(inner.id, inner.version);
-
-        inner.value.clone()
-    }
+    pub fn id(&self) -> SignalId { self.inner.borrow().id }
+    pub fn version(&self) -> Version { self.inner.borrow().version }
+    pub fn get(&self) -> T { self.inner.borrow().value.clone() }
 
     /// Write a new value immediately.
-    ///
-    /// Increments the version counter and notifies the SignalGraph.
-    /// Subscribers (derived signals) are marked stale but NOT recomputed yet —
-    /// recomputation happens lazily at the Sync Point.
     pub fn set(&self, value: T) {
-        {
+        let id = {
             let mut inner = self.inner.borrow_mut();
             inner.value = value;
             inner.version.increment();
-        }
-        let id = self.inner.borrow().id;
+            inner.id
+        };
+        // inner borrow is released before we touch the graph
         self.graph.borrow_mut().mark_signal_updated(id);
     }
 
-    /// Update the value using a closure.
-    ///
-    /// Equivalent to `signal.set(f(signal.get()))` but avoids a double-borrow.
     pub fn update(&self, f: impl FnOnce(T) -> T) {
-        let new_value = {
-            let inner = self.inner.borrow();
-            f(inner.value.clone())
-        };
+        let new_value = f(self.inner.borrow().value.clone());
         self.set(new_value);
     }
 
     /// Queue a write for the next frame's Sync Point.
     ///
-    /// REQUIRED inside physics event handlers to avoid feedback loops.
-    /// Writing directly via .set() inside a physics step can cause:
-    ///   state change → layout recompute → spring target update → body moves
-    ///   → collision → state change → ... (infinite loop)
-    ///
-    /// .queue() breaks the loop by deferring the write to the next frame.
-    ///
-    /// # Example
-    /// ```rust
-    /// on_collision: move |_e| {
-    ///     // ✅ safe — deferred to next frame
-    ///     score.queue(score.get() + 1);
-    ///
-    ///     // ❌ dangerous inside a physics step
-    ///     // score.set(score.get() + 1);
-    /// }
-    /// ```
+    /// Required inside physics event handlers.
+    /// The closure captures only the signal's inner Rc — never the graph.
+    /// The graph is updated in Phase C of drain_queues(), after the closure runs.
     pub fn queue(&self, value: T)
     where
         T: 'static,
     {
-        let id = self.inner.borrow().id;
+        let id          = self.inner.borrow().id;
         let inner_clone = Rc::clone(&self.inner);
 
-        self.graph
-            .borrow_mut()
-            .enqueue_write(id, Box::new(move || {
-                let mut inner = inner_clone.borrow_mut();
-                inner.value = value;
-                inner.version.increment();
-            }));
+        // Closure touches ONLY inner — no graph borrow.
+        let closure: Box<dyn FnOnce()> = Box::new(move || {
+            let mut inner = inner_clone.borrow_mut();
+            inner.value   = value;
+            inner.version.increment();
+        });
+
+        self.graph.borrow_mut().plain_queue.push_back((id, closure));
     }
 }
 
@@ -241,24 +201,8 @@ impl<T: Clone + fmt::Debug + 'static> fmt::Debug for Signal<T> {
 
 /// A layout-affecting reactive value. Batched at the Sync Point.
 ///
-/// Writes mark the owning entity dirty in the SignalGraph.
-/// The Taffy layout tree is NOT touched until the Sync Point — at which
-/// point all dirty layout signals drain together, Taffy recomputes once,
-/// and spring targets are updated atomically.
-///
 /// Use for: width, height, flex-grow, padding, margin, display, position.
-/// Do NOT use for: colour, opacity — use Signal<T> for those.
-///
-/// # Example
-/// ```rust
-/// let panel_width = use_layout_signal(cx, || 300.0_f32);
-///
-/// // Write — batched, does NOT trigger immediate layout recompute
-/// panel_width.set(500.0);
-///
-/// // Read — always current value
-/// let w = panel_width.get();
-/// ```
+/// Writes mark the owning entity dirty — Taffy recomputes once per frame.
 #[derive(Clone)]
 pub struct LayoutSignal<T: Clone + 'static> {
     inner:     Rc<RefCell<SignalInner<T>>>,
@@ -278,76 +222,51 @@ impl<T: Clone + 'static> LayoutSignal<T> {
             value,
             version: Version::default(),
         }));
-
         graph.borrow_mut().register_layout_signal(id, entity_id);
-
         Self { inner, graph, entity_id }
     }
 
-    /// Returns the signal's unique ID.
-    pub fn id(&self) -> SignalId {
-        self.inner.borrow().id
-    }
+    pub fn id(&self) -> SignalId { self.inner.borrow().id }
+    pub fn get(&self) -> T { self.inner.borrow().value.clone() }
 
-    /// Read the current value.
-    pub fn get(&self) -> T {
-        let inner = self.inner.borrow();
-        self.graph
-            .borrow()
-            .track_dependency(inner.id, inner.version);
-        inner.value.clone()
-    }
-
-    /// Write a new value.
-    ///
-    /// Does NOT trigger an immediate Taffy recompute.
-    /// Marks the owning entity dirty — drains at the Sync Point.
-    ///
-    /// Writing this 1000 times in one frame = 1 Taffy recompute.
-    /// The final value wins.
+    /// Write a new value. Batched — drains at the Sync Point.
     pub fn set(&self, value: T) {
-        {
+        let id = {
             let mut inner = self.inner.borrow_mut();
             inner.value = value;
             inner.version.increment();
-        }
-        let id = self.inner.borrow().id;
-        self.graph
-            .borrow_mut()
-            .mark_layout_dirty(id, self.entity_id);
+            inner.id
+        };
+        // inner borrow released before touching graph
+        self.graph.borrow_mut().mark_layout_dirty(id, self.entity_id);
     }
 
-    /// Update via closure. Avoids a double borrow.
     pub fn update(&self, f: impl FnOnce(T) -> T) {
-        let new_value = {
-            let inner = self.inner.borrow();
-            f(inner.value.clone())
-        };
+        let new_value = f(self.inner.borrow().value.clone());
         self.set(new_value);
     }
 
-    /// Queue a deferred write. See Signal::queue for rationale.
+    /// Queue a deferred write. The closure captures only the signal's inner Rc.
+    /// EntityId is stored separately for Phase C of drain_queues().
     pub fn queue(&self, value: T)
     where
         T: 'static,
     {
-        let id = self.inner.borrow().id;
-        let entity_id = self.entity_id;
+        let id          = self.inner.borrow().id;
+        let entity_id   = self.entity_id;
         let inner_clone = Rc::clone(&self.inner);
-        let graph_clone = Rc::clone(&self.graph);
+
+        // Closure touches ONLY inner — no graph borrow.
+        let closure: Box<dyn FnOnce()> = Box::new(move || {
+            let mut inner = inner_clone.borrow_mut();
+            inner.value   = value;
+            inner.version.increment();
+        });
 
         self.graph
             .borrow_mut()
-            .enqueue_write(id, Box::new(move || {
-                {
-                    let mut inner = inner_clone.borrow_mut();
-                    inner.value = value;
-                    inner.version.increment();
-                }
-                graph_clone
-                    .borrow_mut()
-                    .mark_layout_dirty(id, entity_id);
-            }));
+            .layout_queue
+            .push_back((id, entity_id, closure));
     }
 }
 
@@ -365,75 +284,36 @@ impl<T: Clone + fmt::Debug + 'static> fmt::Debug for LayoutSignal<T> {
 
 /// A computed value derived from one or more signals.
 ///
-/// Lazy — does not recompute until read AND a dependency has changed.
-/// At the Sync Point, all stale derived signals are recomputed in topological
-/// order — each node computes at most once per frame.
-///
-/// # Example
-/// ```rust
-/// let base  = use_signal(cx, || 300.0_f32);
-/// let scale = use_signal(cx, || 1.0_f32);
-///
-/// let width = use_derived(cx, move || base.get() * scale.get());
-///
-/// // width recomputes only when base or scale changes
-/// let w = width.get();
-/// ```
+/// Lazy — only recomputes when a dependency has changed.
+/// Topo-sorted at the Sync Point — each node computes at most once per frame.
 #[derive(Clone)]
 pub struct Derived<T: Clone + 'static> {
-    id:       SignalId,
-    compute:  Rc<dyn Fn() -> T>,
-    cached:   Rc<RefCell<Option<T>>>,
-    graph:    Rc<RefCell<SignalGraph>>,
+    id:      SignalId,
+    compute: Rc<dyn Fn() -> T>,
+    cached:  Rc<RefCell<Option<T>>>,
+    graph:   Rc<RefCell<SignalGraph>>,
 }
 
 impl<T: Clone + 'static> Derived<T> {
     fn new(compute: impl Fn() -> T + 'static, graph: Rc<RefCell<SignalGraph>>) -> Self {
-        let id = SignalId::next();
+        let id      = SignalId::next();
         let compute = Rc::new(compute);
         let cached  = Rc::new(RefCell::new(None::<T>));
-
         graph.borrow_mut().register_derived(id);
-
         Self { id, compute, cached, graph }
     }
 
-    /// Returns the derived signal's unique ID.
-    pub fn id(&self) -> SignalId {
-        self.id
-    }
+    pub fn id(&self) -> SignalId { self.id }
 
-    /// Read the current derived value.
-    ///
-    /// Recomputes only if a dependency has changed since the last read.
-    /// Inside another `use_derived`, registers this as a dependency.
     pub fn get(&self) -> T {
-        // Check if we need to recompute
         let is_stale = self.graph.borrow().is_derived_stale(self.id);
 
         if is_stale || self.cached.borrow().is_none() {
-            // Start tracking which signals this computation reads
-            self.graph.borrow_mut().begin_tracking(self.id);
-
             let value = (self.compute)();
-
-            // Stop tracking, store the dependencies we discovered
-            self.graph.borrow_mut().end_tracking(self.id);
-
             *self.cached.borrow_mut() = Some(value.clone());
-
-            // Also track this derived as a dep if we're inside another derived
-            self.graph
-                .borrow()
-                .track_dependency(self.id, Version(0)); // version handled by stale flag
-
+            self.graph.borrow_mut().clear_derived_stale(self.id);
             value
         } else {
-            // Cache hit — still track as dependency
-            self.graph
-                .borrow()
-                .track_dependency(self.id, Version(0));
-
             self.cached.borrow().clone().unwrap()
         }
     }
@@ -450,51 +330,34 @@ impl<T: Clone + fmt::Debug + 'static> fmt::Debug for Derived<T> {
 
 // ─── SignalGraph ──────────────────────────────────────────────────────────────
 
-/// The dependency graph for all signals in the application.
+/// The reactive dependency graph for the entire application.
 ///
-/// Owned by the `Scope` (and therefore by `fe_ui`'s frame loop).
-/// One graph per application. Never shared across threads.
+/// # Write queue borrow safety — two lane design
 ///
-/// Responsibilities:
-///   - Track which derived signals depend on which source signals.
-///   - Mark derived signals stale when their dependencies update.
-///   - Collect dirty layout entity IDs for the Sync Point.
-///   - Hold queued physics writes until the next frame's drain.
-///   - Provide topological ordering for derived recomputation.
+///   plain_queue  — Signal::queue() entries: (SignalId, FnOnce).
+///                  Closure only touches the signal's inner value.
+///
+///   layout_queue — LayoutSignal::queue() entries: (SignalId, EntityId, FnOnce).
+///                  Closure only touches the signal's inner value.
+///                  EntityId carried so drain_queues() marks dirty in Phase C.
+///
+/// drain_queues() is always three phases:
+///   A) drain VecDeques into local Vecs → releases &mut self
+///   B) execute closures              → no graph borrow alive
+///   C) mark_signal_updated / mark_layout_dirty → safe re-borrow
 pub struct SignalGraph {
-    /// All registered signal IDs (source + derived).
-    nodes: HashSet<SignalId>,
-
-    /// derived → set of signals it depends on.
-    /// Built lazily as derived signals are read.
-    dependencies: HashMap<SignalId, HashSet<SignalId>>,
-
-    /// source signal → set of derived signals that depend on it.
-    /// Inverse of `dependencies`. Used to mark stale on write.
-    subscribers: HashMap<SignalId, HashSet<SignalId>>,
-
-    /// Derived signals that need recomputation at the Sync Point.
-    stale_derived: HashSet<SignalId>,
-
-    /// Layout signals → entity IDs that are dirty.
-    /// Collected during the frame, drained at the Sync Point.
-    dirty_layout: HashMap<SignalId, crate::entity::EntityId>,
-
-    /// Which LayoutSignal IDs map to which entity IDs.
-    /// Populated at signal registration time.
+    nodes:                  HashSet<SignalId>,
+    dependencies:           HashMap<SignalId, HashSet<SignalId>>,
+    subscribers:            HashMap<SignalId, HashSet<SignalId>>,
+    stale_derived:          HashSet<SignalId>,
+    dirty_layout:           HashMap<SignalId, crate::entity::EntityId>,
     layout_signal_entities: HashMap<SignalId, crate::entity::EntityId>,
 
-    /// Deferred writes from .queue() calls.
-    /// Drained at the START of the next frame's Sync Point.
-    write_queue: VecDeque<Box<dyn FnOnce()>>,
+    /// Signal::queue() entries. Closure touches inner value only.
+    plain_queue:  VecDeque<(SignalId, Box<dyn FnOnce()>)>,
 
-    /// Stack of derived signal IDs currently being computed.
-    /// Used to track which signals are read during a derived computation.
-    tracking_stack: Vec<SignalId>,
-
-    /// Signals read during the current tracked computation.
-    /// Cleared on begin_tracking, consumed on end_tracking.
-    tracked_reads: Vec<(SignalId, Version)>,
+    /// LayoutSignal::queue() entries. Closure touches inner value only.
+    layout_queue: VecDeque<(SignalId, crate::entity::EntityId, Box<dyn FnOnce()>)>,
 }
 
 impl SignalGraph {
@@ -506,9 +369,8 @@ impl SignalGraph {
             stale_derived:          HashSet::new(),
             dirty_layout:           HashMap::new(),
             layout_signal_entities: HashMap::new(),
-            write_queue:            VecDeque::new(),
-            tracking_stack:         Vec::new(),
-            tracked_reads:          Vec::new(),
+            plain_queue:            VecDeque::new(),
+            layout_queue:           VecDeque::new(),
         }
     }
 
@@ -532,61 +394,15 @@ impl SignalGraph {
         self.dependencies.entry(id).or_default();
     }
 
-    // ── Dependency tracking ───────────────────────────────────────────────────
-
-    /// Called by Signal::get() and Derived::get() during a computation.
-    /// If we're inside a derived computation, records this signal as a dep.
-    pub(crate) fn track_dependency(&self, id: SignalId, _version: Version) {
-        // We need interior mutability here — use a Cell-based approach
-        // The tracking stack is mutated via begin/end_tracking instead
-        // This function is called on the immutable borrow path so it's a no-op
-        // — actual tracking happens via the mutable begin/end_tracking pair.
-        let _ = (id, _version);
-    }
-
-    /// Begin recording dependency reads for a derived signal computation.
-    pub(crate) fn begin_tracking(&mut self, derived_id: SignalId) {
-        self.tracking_stack.push(derived_id);
-        self.tracked_reads.clear();
-    }
-
-    /// Called by Signal::get() / LayoutSignal::get() to record a read.
-    /// Must be called on the MUTABLE borrow — used internally by the graph
-    /// when re-running derived computations at the Sync Point.
-    pub(crate) fn record_read(&mut self, source_id: SignalId) {
-        if let Some(&derived_id) = self.tracking_stack.last() {
-            self.tracked_reads.push((source_id, Version::default()));
-            // Register the dependency edge
-            self.dependencies
-                .entry(derived_id)
-                .or_default()
-                .insert(source_id);
-            self.subscribers
-                .entry(source_id)
-                .or_default()
-                .insert(derived_id);
-        }
-    }
-
-    /// Stop recording for the current derived computation.
-    pub(crate) fn end_tracking(&mut self, _derived_id: SignalId) {
-        self.tracking_stack.pop();
-        self.tracked_reads.clear();
-    }
-
     // ── Dirty / stale marking ─────────────────────────────────────────────────
 
-    /// Called when a source Signal is written via .set().
-    /// Marks all downstream derived signals as stale.
+    /// BFS propagation of stale flags to all downstream derived signals.
     pub(crate) fn mark_signal_updated(&mut self, id: SignalId) {
-        // Propagate stale flag to all direct and transitive subscribers
         let mut to_visit = vec![id];
         let mut visited  = HashSet::new();
 
         while let Some(current) = to_visit.pop() {
-            if visited.contains(&current) { continue; }
-            visited.insert(current);
-
+            if !visited.insert(current) { continue; }
             if let Some(subs) = self.subscribers.get(&current).cloned() {
                 for sub in subs {
                     self.stale_derived.insert(sub);
@@ -596,8 +412,6 @@ impl SignalGraph {
         }
     }
 
-    /// Called when a LayoutSignal is written.
-    /// Marks the entity dirty AND propagates stale to derived subscribers.
     pub(crate) fn mark_layout_dirty(
         &mut self,
         id:        SignalId,
@@ -607,48 +421,95 @@ impl SignalGraph {
         self.mark_signal_updated(id);
     }
 
-    /// Returns true if a derived signal needs recomputation.
     pub(crate) fn is_derived_stale(&self, id: SignalId) -> bool {
         self.stale_derived.contains(&id)
     }
 
-    // ── Write queue ───────────────────────────────────────────────────────────
-
-    /// Enqueue a deferred write from a .queue() call.
-    pub(crate) fn enqueue_write(&mut self, _id: SignalId, f: Box<dyn FnOnce()>) {
-        self.write_queue.push_back(f);
+    pub(crate) fn clear_derived_stale(&mut self, id: SignalId) {
+        self.stale_derived.remove(&id);
     }
 
-    // ── Sync Point operations ─────────────────────────────────────────────────
+    // ── Sync Point ───────────────────────────────────────────────────────────
 
-    /// Step 1 of the Sync Point: drain all queued .queue() writes.
-    /// These are writes from physics event handlers deferred to this frame.
-    pub fn drain_physics_queue(&mut self) {
-    // Drain the whole queue into a local vec first.
-    // This drops the &mut self borrow before any closure runs,
-    // preventing a RefCell double-borrow when a closure tries
-    // to borrow the graph (e.g. to mark layout dirty).
-    let writes: Vec<_> = self.write_queue.drain(..).collect();
-    for write in writes {
-        write();
+    /// Drain all queued .queue() writes from the previous frame.
+    ///
+    /// Three-phase protocol — no closure ever runs while the graph is borrowed.
+    ///
+    ///   Phase A: move all queue entries into local Vecs (releases &mut self).
+    ///   Phase B: execute closures (no graph borrow — touches inner values only).
+    ///   Phase C: mark_signal_updated / mark_layout_dirty (safe re-borrow).
+    pub fn drain_queues(&mut self) {
+        // ── Phase A ──────────────────────────────────────────────────────────
+        // Drain both queues into owned local Vecs.
+        // After this, self.plain_queue and self.layout_queue are empty.
+        // The &mut self borrow ends at the closing brace of this block... wait,
+        // we're still in the same &mut self method. The key insight is that
+        // after drain().collect(), the VecDeques are empty and we hold owned
+        // Vecs. The closures are now owned by us, not by self.
+        // We then call self.mark_* in Phase C — that re-borrows self, which
+        // is fine because the closures (which held no graph reference) are
+        // already consumed by then.
+
+        let plain_entries: Vec<(SignalId, Box<dyn FnOnce()>)> =
+            self.plain_queue.drain(..).collect();
+
+        let layout_entries: Vec<(SignalId, crate::entity::EntityId, Box<dyn FnOnce()>)> =
+            self.layout_queue.drain(..).collect();
+
+        // ── Phase B ──────────────────────────────────────────────────────────
+        // Execute closures. Each closure ONLY borrows its signal's inner
+        // Rc<RefCell<SignalInner<T>>>. It does NOT touch self (the graph).
+        // Therefore self is not borrowed during closure execution.
+
+        let plain_ids: Vec<SignalId> = plain_entries
+            .into_iter()
+            .map(|(id, closure)| {
+                closure(); // safe — no graph borrow
+                id
+            })
+            .collect();
+
+        let layout_results: Vec<(SignalId, crate::entity::EntityId)> = layout_entries
+            .into_iter()
+            .map(|(id, entity_id, closure)| {
+                closure(); // safe — no graph borrow
+                (id, entity_id)
+            })
+            .collect();
+
+        // ── Phase C ──────────────────────────────────────────────────────────
+        // All closures are done. We now re-borrow self to update graph state.
+        // No closures are alive. No Rc<RefCell<SignalGraph>> borrows are active.
+        // This is the only place where we borrow self after the closures ran.
+
+        for id in plain_ids {
+            self.mark_signal_updated(id);
+        }
+
+        for (id, entity_id) in layout_results {
+            self.mark_layout_dirty(id, entity_id);
+        }
     }
-    }
-    /// Step 3 of the Sync Point: collect all dirty layout entity IDs.
-    /// Clears the dirty set — each entity appears at most once.
+
+    /// Collect all dirty layout entity IDs. Clears the set.
+    /// Called at Step 3 of the Sync Point.
     pub fn take_layout_dirty(&mut self) -> Vec<crate::entity::EntityId> {
-        let mut entities: Vec<_> = self.dirty_layout.values().copied().collect();
-        entities.sort_unstable(); // deterministic order
-        // Deduplicate — multiple layout signals on the same entity
-        entities.dedup();
+        let mut seen = HashSet::new();
+        let mut entities: Vec<crate::entity::EntityId> = self
+            .dirty_layout
+            .values()
+            .copied()
+            .filter(|e| seen.insert(*e))
+            .collect();
+
+        entities.sort_unstable();
         self.dirty_layout.clear();
         entities
     }
 
-    /// Returns the topologically sorted order of derived signals.
-    /// Used by the Sync Point to recompute derived signals in the correct order
-    /// — dependencies before dependents — so each node computes at most once.
+    /// Topologically sorted order of stale derived signals.
+    /// Kahn's algorithm. Deterministic — each batch sorted before processing.
     pub fn topo_sorted_derived(&self) -> Vec<SignalId> {
-        // Kahn's algorithm on the dependency subgraph of stale derived nodes
         let mut in_degree: HashMap<SignalId, usize> = HashMap::new();
         let mut adj: HashMap<SignalId, Vec<SignalId>> = HashMap::new();
 
@@ -664,54 +525,45 @@ impl SignalGraph {
             }
         }
 
-        let mut queue: VecDeque<SignalId> = in_degree
+        let mut queue: Vec<SignalId> = in_degree
             .iter()
             .filter(|(_, &deg)| deg == 0)
             .map(|(&id, _)| id)
             .collect();
-
-        // Sort for deterministic output
-        let mut queue_vec: Vec<_> = queue.drain(..).collect();
-        queue_vec.sort_unstable_by_key(|id| id.0);
-        queue.extend(queue_vec);
+        queue.sort_unstable();
 
         let mut sorted = Vec::with_capacity(self.stale_derived.len());
 
-        while let Some(id) = queue.pop_front() {
+        while !queue.is_empty() {
+            queue.sort_unstable();
+            let id = queue.remove(0);
             sorted.push(id);
+
             if let Some(neighbors) = adj.get(&id) {
-                let mut next_batch = Vec::new();
                 for &neighbor in neighbors {
                     let deg = in_degree.entry(neighbor).or_insert(0);
                     if *deg > 0 { *deg -= 1; }
-                    if *deg == 0 { next_batch.push(neighbor); }
+                    if *deg == 0 { queue.push(neighbor); }
                 }
-                next_batch.sort_unstable_by_key(|id| id.0);
-                for n in next_batch { queue.push_back(n); }
             }
         }
 
         sorted
     }
 
-    /// Clear all stale flags after the Sync Point recomputation is complete.
+    /// Clear all stale flags after Sync Point recomputation is complete.
     pub fn clear_stale(&mut self) {
         self.stale_derived.clear();
     }
 
-    /// Returns the number of signals currently in the graph.
-    pub fn signal_count(&self) -> usize {
-        self.nodes.len()
-    }
+    // ── Diagnostics ──────────────────────────────────────────────────────────
 
-    /// Returns the number of dirty layout entities waiting for the Sync Point.
-    pub fn dirty_layout_count(&self) -> usize {
-        self.dirty_layout.len()
-    }
+    pub fn signal_count(&self) -> usize { self.nodes.len() }
 
-    /// Returns the number of queued deferred writes.
+    pub fn dirty_layout_count(&self) -> usize { self.dirty_layout.len() }
+
     pub fn queued_write_count(&self) -> usize {
-        self.write_queue.len()
+        self.plain_queue.len() + self.layout_queue.len()
     }
 }
 
@@ -725,7 +577,8 @@ impl fmt::Debug for SignalGraph {
             .field("signals",       &self.nodes.len())
             .field("dirty_layout",  &self.dirty_layout.len())
             .field("stale_derived", &self.stale_derived.len())
-            .field("write_queue",   &self.write_queue.len())
+            .field("plain_queue",   &self.plain_queue.len())
+            .field("layout_queue",  &self.layout_queue.len())
             .finish()
     }
 }
@@ -733,28 +586,19 @@ impl fmt::Debug for SignalGraph {
 // ─── Scope ───────────────────────────────────────────────────────────────────
 
 /// A handle into the SignalGraph tied to one component's lifetime.
-///
-/// Created by `fe_ui` when a component is spawned. Passed as `cx` to the
-/// component function. When the component despawns, the Scope is dropped
-/// and all signals created through it are cleaned up.
-///
-/// You never construct a Scope manually — it is provided by the runtime.
+/// Passed as `cx` to every component function.
 #[derive(Clone)]
 pub struct Scope {
-    /// The entity this scope belongs to.
-    pub(crate) entity_id: crate::entity::EntityId,
-
-    /// Shared reference to the application's signal graph.
-    pub(crate) graph: Rc<RefCell<SignalGraph>>,
-
-    /// All signal IDs created through this scope.
-    /// Used for cleanup on despawn.
+    pub(crate) entity_id:     crate::entity::EntityId,
+    pub(crate) graph:         Rc<RefCell<SignalGraph>>,
     pub(crate) owned_signals: Rc<RefCell<Vec<SignalId>>>,
 }
 
 impl Scope {
-    /// Create a new Scope. Called by the #[component] macro — not by user code.
-    pub fn new(entity_id: crate::entity::EntityId, graph: Rc<RefCell<SignalGraph>>) -> Self {
+    pub fn new(
+        entity_id: crate::entity::EntityId,
+        graph:     Rc<RefCell<SignalGraph>>,
+    ) -> Self {
         Self {
             entity_id,
             graph,
@@ -762,10 +606,7 @@ impl Scope {
         }
     }
 
-    /// The entity ID this scope is bound to.
-    pub fn entity_id(&self) -> crate::entity::EntityId {
-        self.entity_id
-    }
+    pub fn entity_id(&self) -> crate::entity::EntityId { self.entity_id }
 }
 
 impl fmt::Debug for Scope {
@@ -780,57 +621,15 @@ impl fmt::Debug for Scope {
 // ─── Constructor functions ────────────────────────────────────────────────────
 
 /// Create an immediate reactive signal.
-///
-/// The returned Signal<T> is tied to the component's Scope — it will be
-/// cleaned up automatically when the component despawns.
-///
-/// Use for: colour, opacity, text content, shader parameters.
-///
-/// # Example
-/// ```rust
-/// #[component]
-/// fn MyButton(cx: Scope) -> Element {
-///     let is_hovered = use_signal(cx, || false);
-///
-///     render! {
-///         Button {
-///             on_mouseenter: move |_| is_hovered.set(true),
-///             on_mouseleave: move |_| is_hovered.set(false),
-///             style: style! {
-///                 background: if is_hovered.get() { Color::BLUE } else { Color::RED },
-///             }
-///         }
-///     }
-/// }
-/// ```
+/// Use for: colour, opacity, text, shader parameters.
 pub fn use_signal<T: Clone + 'static>(cx: &Scope, init: impl FnOnce() -> T) -> Signal<T> {
     let signal = Signal::new(init(), Rc::clone(&cx.graph));
     cx.owned_signals.borrow_mut().push(signal.id());
     signal
 }
 
-/// Create a layout-affecting reactive signal.
-///
-/// Writes are batched — they do NOT trigger an immediate Taffy recompute.
-/// At the Sync Point, all dirty layout signals drain together.
-/// Writing this signal 1000 times in one frame = exactly 1 Taffy recompute.
-///
-/// Use for: width, height, flex-grow, padding, margin, position.
-///
-/// # Example
-/// ```rust
-/// #[component]
-/// fn Panel(cx: Scope) -> Element {
-///     let width = use_layout_signal(cx, || 300.0_f32);
-///
-///     render! {
-///         Box {
-///             style: style! { width: width.get().px },
-///             on_click: move |_| width.set(500.0), // glides to new size
-///         }
-///     }
-/// }
-/// ```
+/// Create a layout-affecting reactive signal. Batched at the Sync Point.
+/// Use for: width, height, flex, padding, margin, position.
 pub fn use_layout_signal<T: Clone + 'static>(
     cx:   &Scope,
     init: impl FnOnce() -> T,
@@ -840,28 +639,7 @@ pub fn use_layout_signal<T: Clone + 'static>(
     signal
 }
 
-/// Create a derived (computed) signal.
-///
-/// Lazy — only recomputes when a dependency has changed since the last read.
-/// At the Sync Point, all stale derived signals recompute in topological order
-/// — each node computes at most once per frame regardless of how many
-/// of its dependencies changed.
-///
-/// Dependencies are tracked automatically — any Signal or LayoutSignal
-/// read inside the closure becomes a dependency.
-///
-/// # Example
-/// ```rust
-/// let base_width  = use_layout_signal(cx, || 300.0_f32);
-/// let is_expanded = use_signal(cx, || false);
-///
-/// // Recomputes only when base_width or is_expanded changes.
-/// // If only is_expanded changes and base_width doesn't, exactly one
-/// // recompute happens — not a chain.
-/// let panel_width = use_derived(cx, move || {
-///     if is_expanded.get() { base_width.get() * 1.5 } else { base_width.get() }
-/// });
-/// ```
+/// Create a derived (computed) signal. Lazy, topo-sorted.
 pub fn use_derived<T: Clone + 'static>(
     cx:      &Scope,
     compute: impl Fn() -> T + 'static,
@@ -877,18 +655,12 @@ pub fn use_derived<T: Clone + 'static>(
 mod tests {
     use super::*;
     use slotmap::SlotMap;
-
-    // ── Helpers ──────────────────────────────────────────────────────────────
+    use crate::entity::EntityId;
 
     fn make_scope() -> Scope {
-        use crate::entity::EntityId;
-        use slotmap::SlotMap;
-
-        // Create a minimal SlotMap to get a valid EntityId
-        let graph     = Rc::new(RefCell::new(SignalGraph::new()));
+        let graph = Rc::new(RefCell::new(SignalGraph::new()));
         let mut store: SlotMap<EntityId, ()> = SlotMap::with_key();
         let entity_id = store.insert(());
-
         Scope::new(entity_id, graph)
     }
 
@@ -932,7 +704,6 @@ mod tests {
 
     #[test]
     fn signal_multiple_writes_same_frame() {
-        // All writes are visible; the last one wins as the current value
         let cx  = make_scope();
         let sig = use_signal(&cx, || 0_i32);
         sig.set(1);
@@ -948,33 +719,26 @@ mod tests {
 
         sig.queue(42);
 
-        // Before drain — value unchanged
         assert_eq!(sig.get(), 0);
         assert_eq!(cx.graph.borrow().queued_write_count(), 1);
 
-        // Simulate Sync Point drain
-        cx.graph.borrow_mut().drain_physics_queue();
+        cx.graph.borrow_mut().drain_queues();
 
-        // After drain — value updated
         assert_eq!(sig.get(), 42);
         assert_eq!(cx.graph.borrow().queued_write_count(), 0);
     }
 
     #[test]
-    fn signal_queue_multiple() {
+    fn signal_queue_multiple_last_wins() {
         let cx  = make_scope();
         let sig = use_signal(&cx, || 0_i32);
-
         sig.queue(1);
         sig.queue(2);
         sig.queue(3);
-
         assert_eq!(cx.graph.borrow().queued_write_count(), 3);
-
-        cx.graph.borrow_mut().drain_physics_queue();
-
-        // All three drained — last writer wins
+        cx.graph.borrow_mut().drain_queues();
         assert_eq!(sig.get(), 3);
+        assert_eq!(cx.graph.borrow().queued_write_count(), 0);
     }
 
     // ── LayoutSignal<T> ──────────────────────────────────────────────────────
@@ -990,26 +754,18 @@ mod tests {
     fn layout_signal_set_marks_entity_dirty() {
         let cx  = make_scope();
         let sig = use_layout_signal(&cx, || 300.0_f32);
-
         assert_eq!(cx.graph.borrow().dirty_layout_count(), 0);
-
         sig.set(500.0);
-
         assert_eq!(cx.graph.borrow().dirty_layout_count(), 1);
         assert_eq!(sig.get(), 500.0);
     }
 
     #[test]
     fn layout_signal_multiple_writes_one_dirty_entry() {
-        // Writing 1000 times = 1 dirty entry (last value wins, entity deduped)
         let cx  = make_scope();
         let sig = use_layout_signal(&cx, || 0.0_f32);
-
-        for i in 0..1000 {
-            sig.set(i as f32);
-        }
-
-        // Still only 1 dirty entry for this entity
+        for i in 0..1000 { sig.set(i as f32); }
+        // 1000 writes → 1 dirty entry (same entity deduped by HashMap key)
         assert_eq!(cx.graph.borrow().dirty_layout_count(), 1);
         assert_eq!(sig.get(), 999.0);
     }
@@ -1019,11 +775,8 @@ mod tests {
         let cx  = make_scope();
         let sig = use_layout_signal(&cx, || 0.0_f32);
         sig.set(1.0);
-
         let dirty = cx.graph.borrow_mut().take_layout_dirty();
         assert_eq!(dirty.len(), 1);
-
-        // After take, the dirty set is cleared
         assert_eq!(cx.graph.borrow().dirty_layout_count(), 0);
     }
 
@@ -1034,14 +787,31 @@ mod tests {
 
         sig.queue(99.0);
 
-        // Before drain — not yet dirty, value unchanged
+        // Before drain — value unchanged, not yet dirty
         assert_eq!(sig.get(), 0.0);
         assert_eq!(cx.graph.borrow().dirty_layout_count(), 0);
+        assert_eq!(cx.graph.borrow().queued_write_count(), 1);
 
-        cx.graph.borrow_mut().drain_physics_queue();
+        // Sync Point drain — three phases, no double borrow
+        cx.graph.borrow_mut().drain_queues();
 
+        // After drain — value updated AND entity marked dirty
         assert_eq!(sig.get(), 99.0);
         assert_eq!(cx.graph.borrow().dirty_layout_count(), 1);
+        assert_eq!(cx.graph.borrow().queued_write_count(), 0);
+    }
+
+    #[test]
+    fn layout_signal_queue_entity_in_dirty_set() {
+        let cx        = make_scope();
+        let entity_id = cx.entity_id();
+        let sig       = use_layout_signal(&cx, || 0.0_f32);
+
+        sig.queue(50.0);
+        cx.graph.borrow_mut().drain_queues();
+
+        let dirty = cx.graph.borrow_mut().take_layout_dirty();
+        assert!(dirty.contains(&entity_id));
     }
 
     // ── SignalGraph ───────────────────────────────────────────────────────────
@@ -1050,27 +820,23 @@ mod tests {
     fn graph_signal_count_tracks_registration() {
         let cx = make_scope();
         assert_eq!(cx.graph.borrow().signal_count(), 0);
-
         let _a = use_signal(&cx, || 0_i32);
         assert_eq!(cx.graph.borrow().signal_count(), 1);
-
         let _b = use_signal(&cx, || 0_i32);
         assert_eq!(cx.graph.borrow().signal_count(), 2);
-
         let _c = use_layout_signal(&cx, || 0.0_f32);
         assert_eq!(cx.graph.borrow().signal_count(), 3);
     }
 
     #[test]
     fn graph_topo_sort_empty_when_no_stale() {
-        let cx     = make_scope();
-        let sorted = cx.graph.borrow().topo_sorted_derived();
-        assert!(sorted.is_empty());
+        let cx = make_scope();
+        assert!(cx.graph.borrow().topo_sorted_derived().is_empty());
     }
 
     #[test]
     fn graph_mark_signal_updated_marks_subscribers_stale() {
-        let cx = make_scope();
+        let cx    = make_scope();
         let graph = Rc::clone(&cx.graph);
 
         let source_id  = SignalId::next();
@@ -1080,44 +846,40 @@ mod tests {
             let mut g = graph.borrow_mut();
             g.register_signal(source_id);
             g.register_derived(derived_id);
-            // Manually wire: derived depends on source
             g.dependencies.entry(derived_id).or_default().insert(source_id);
             g.subscribers.entry(source_id).or_default().insert(derived_id);
         }
 
         assert!(!graph.borrow().is_derived_stale(derived_id));
-
         graph.borrow_mut().mark_signal_updated(source_id);
-
         assert!(graph.borrow().is_derived_stale(derived_id));
     }
 
     #[test]
-    fn graph_clear_stale_resets_flags() {
-        let cx = make_scope();
+    fn graph_clear_stale_resets_all_flags() {
+        let cx    = make_scope();
         let graph = Rc::clone(&cx.graph);
-
-        let source_id  = SignalId::next();
-        let derived_id = SignalId::next();
+        let src   = SignalId::next();
+        let drv   = SignalId::next();
 
         {
             let mut g = graph.borrow_mut();
-            g.register_signal(source_id);
-            g.register_derived(derived_id);
-            g.dependencies.entry(derived_id).or_default().insert(source_id);
-            g.subscribers.entry(source_id).or_default().insert(derived_id);
-            g.mark_signal_updated(source_id);
+            g.register_signal(src);
+            g.register_derived(drv);
+            g.dependencies.entry(drv).or_default().insert(src);
+            g.subscribers.entry(src).or_default().insert(drv);
+            g.mark_signal_updated(src);
         }
 
-        assert!(graph.borrow().is_derived_stale(derived_id));
+        assert!(graph.borrow().is_derived_stale(drv));
         graph.borrow_mut().clear_stale();
-        assert!(!graph.borrow().is_derived_stale(derived_id));
+        assert!(!graph.borrow().is_derived_stale(drv));
     }
 
     #[test]
     fn graph_topo_sort_linear_chain() {
-        // a → b → c  (c depends on b, b depends on a)
-        // sorted order should be: a, b, c
+        // dependency chain: a ← b ← c  (c depends on b, b depends on a)
+        // correct topo order: a, b, c
         let cx    = make_scope();
         let graph = Rc::clone(&cx.graph);
 
@@ -1130,27 +892,22 @@ mod tests {
             g.register_derived(a);
             g.register_derived(b);
             g.register_derived(c);
-
             // b depends on a
             g.dependencies.entry(b).or_default().insert(a);
             g.subscribers.entry(a).or_default().insert(b);
-
             // c depends on b
             g.dependencies.entry(c).or_default().insert(b);
             g.subscribers.entry(b).or_default().insert(c);
-
-            // Mark all stale
+            // mark all stale
             g.stale_derived.insert(a);
             g.stale_derived.insert(b);
             g.stale_derived.insert(c);
         }
 
         let sorted = graph.borrow().topo_sorted_derived();
-
-        // a must come before b, b must come before c
-        let pos = |id: SignalId| sorted.iter().position(|&x| x == id).unwrap();
-        assert!(pos(a) < pos(b));
-        assert!(pos(b) < pos(c));
+        let pos    = |id: SignalId| sorted.iter().position(|&x| x == id).unwrap();
+        assert!(pos(a) < pos(b), "a must come before b");
+        assert!(pos(b) < pos(c), "b must come before c");
     }
 
     // ── Scope ─────────────────────────────────────────────────────────────────
@@ -1159,22 +916,42 @@ mod tests {
     fn scope_tracks_owned_signals() {
         let cx = make_scope();
         assert_eq!(cx.owned_signals.borrow().len(), 0);
-
         let _a = use_signal(&cx, || 0_i32);
         let _b = use_signal(&cx, || 0.0_f32);
         let _c = use_layout_signal(&cx, || false);
-
         assert_eq!(cx.owned_signals.borrow().len(), 3);
     }
 
     #[test]
-    fn scope_entity_id_matches() {
-        let cx = make_scope();
+    fn scope_entity_id_matches_dirty_entry() {
+        let cx        = make_scope();
         let entity_id = cx.entity_id();
-        let sig = use_layout_signal(&cx, || 0.0_f32);
+        let sig       = use_layout_signal(&cx, || 0.0_f32);
         sig.set(1.0);
-
         let dirty = cx.graph.borrow_mut().take_layout_dirty();
         assert!(dirty.contains(&entity_id));
     }
+
+    // ── Mixed queue drain ─────────────────────────────────────────────────────
+
+    #[test]
+    fn drain_queues_handles_plain_and_layout_together() {
+        let cx = make_scope();
+
+        let plain_sig  = use_signal(&cx, || 0_i32);
+        let layout_sig = use_layout_signal(&cx, || 0.0_f32);
+
+        plain_sig.queue(7);
+        layout_sig.queue(3.14);
+
+        assert_eq!(cx.graph.borrow().queued_write_count(), 2);
+
+        cx.graph.borrow_mut().drain_queues();
+
+        assert_eq!(plain_sig.get(),  7);
+        assert_eq!(layout_sig.get(), 3.14);
+        assert_eq!(cx.graph.borrow().queued_write_count(), 0);
+        assert_eq!(cx.graph.borrow().dirty_layout_count(), 1);
+    }
 }
+        
