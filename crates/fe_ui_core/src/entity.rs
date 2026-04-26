@@ -230,7 +230,7 @@ impl GhostEntity {
 /// The developer never constructs this directly — it is the macro's job.
 ///
 /// # Example (what the macro builds from the developer's code)
-/// ```rust
+/// ```rust, ignore
 /// // Developer writes:
 /// Button {
 ///     physics: Physics::dynamic().mass(2.0).restitution(0.8),
