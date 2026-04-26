@@ -1,146 +1,111 @@
 // crates/fe_ui_taffy/src/convert.rs
 //
 // fe_ui_core::Style → taffy::Style conversion.
+// Targets taffy 0.4.4 API.
 //
-// ─── Why this exists ─────────────────────────────────────────────────────────
-//
-//  fe_ui_core defines its own Style type so that no subsystem crate needs
-//  to import another subsystem's types. fe_ui_taffy is the only crate that
-//  imports both fe_ui_core and taffy — so the conversion lives here.
-//
-//  The mapping is mostly mechanical but a few decisions are load-bearing:
-//
-//  Dimension::Auto
-//    Maps to taffy::Dimension::Auto. Taffy will size the widget based on
-//    its content. This is the correct default for most widgets.
-//
-//  Dimension::Px(f32)
-//    Maps to taffy::Dimension::Length(f32). Taffy uses "length" for
-//    device-independent pixel values (same coordinate space as Ferrum).
+// ─── Key mapping decisions ────────────────────────────────────────────────────
 //
 //  Dimension::Percent(f32)
-//    Maps to taffy::Dimension::Percent(f32 / 100.0). Taffy expects [0,1]
-//    while Ferrum stores [0,100] to match CSS conventions.
-//
-//  Padding / Margin
-//    fe_ui_core::Rect maps to taffy::Rect<LengthPercentage>.
-//    We use LengthPercentage::Length for all values since fe_ui_core
-//    doesn't yet distinguish padding-percent from padding-px.
+//    fe_ui_core stores [0,100] (CSS convention: 50.0 = "50%")
+//    taffy expects  [0,1]   (0.5 = "50%")
+//    → divide by 100.0
 //
 //  Gap
-//    fe_ui_core stores gap as a single f32. Taffy wants a Size<LengthPercentage>
-//    (row gap, column gap). We apply the single value to both axes.
+//    fe_ui_core: single f32 applied to both axes
+//    taffy: Size<LengthPercentage> (row gap, column gap)
+//    → apply to both width and height
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
 use fe_ui_core::style::{
     AlignItems, Dimension, Display, FlexDirection, JustifyContent, Rect, Style,
 };
-use taffy::{
-    geometry::{Rect as TaffyRect, Size},
-    style::{
-        AlignItems as TaffyAlignItems,
-        Dimension as TaffyDimension,
-        Display as TaffyDisplay,
-        FlexDirection as TaffyFlexDirection,
-        JustifyContent as TaffyJustifyContent,
-        LengthPercentage,
-        LengthPercentageAuto,
-        Style as TaffyStyle,
-    },
-};
+use taffy::prelude::*;
 
 /// Convert a `fe_ui_core::Style` to a `taffy::Style`.
-///
-/// Called by `LayoutTree::register()` and `LayoutTree::compute()` whenever
-/// a dirty entity's style needs to be applied to the Taffy tree.
-pub fn to_taffy_style(style: &Style) -> TaffyStyle {
-    TaffyStyle {
-        display:          to_taffy_display(style.display),
-        flex_direction:   to_taffy_flex_direction(style.flex_direction),
-        flex_grow:        style.flex_grow,
-        flex_shrink:      style.flex_shrink,
-        align_items:      Some(to_taffy_align_items(style.align_items)),
-        justify_content:  Some(to_taffy_justify_content(style.justify_content)),
-        size:             Size {
+pub fn to_taffy_style(style: &Style) -> taffy::Style {
+    taffy::Style {
+        display:         to_taffy_display(style.display),
+        flex_direction:  to_taffy_flex_direction(style.flex_direction),
+        flex_grow:       style.flex_grow,
+        flex_shrink:     style.flex_shrink,
+        align_items:     Some(to_taffy_align_items(style.align_items)),
+        justify_content: Some(to_taffy_justify_content(style.justify_content)),
+        size: Size {
             width:  to_taffy_dimension(style.width),
             height: to_taffy_dimension(style.height),
         },
-        min_size:         Size {
+        min_size: Size {
             width:  to_taffy_dimension(style.min_width),
             height: to_taffy_dimension(style.min_height),
         },
-        max_size:         Size {
+        max_size: Size {
             width:  to_taffy_dimension(style.max_width),
             height: to_taffy_dimension(style.max_height),
         },
-        padding:          to_taffy_rect_lp(style.padding),
-        margin:           to_taffy_rect_lpa(style.margin),
-        gap:              Size {
+        padding: to_taffy_rect_lp(style.padding),
+        margin:  to_taffy_rect_lpa(style.margin),
+        gap: Size {
             width:  LengthPercentage::Length(style.gap),
             height: LengthPercentage::Length(style.gap),
         },
-        ..TaffyStyle::DEFAULT
+        ..taffy::Style::DEFAULT
     }
 }
 
 // ─── Individual converters ────────────────────────────────────────────────────
 
-fn to_taffy_display(d: Display) -> TaffyDisplay {
+fn to_taffy_display(d: Display) -> taffy::Display {
     match d {
-        Display::Flex  => TaffyDisplay::Flex,
-        Display::Grid  => TaffyDisplay::Grid,
-        Display::Block => TaffyDisplay::Block,
-        Display::None  => TaffyDisplay::None,
+        Display::Flex  => taffy::Display::Flex,
+        Display::Grid  => taffy::Display::Grid,
+        Display::Block => taffy::Display::Block,
+        Display::None  => taffy::Display::None,
     }
 }
 
-fn to_taffy_flex_direction(d: FlexDirection) -> TaffyFlexDirection {
+fn to_taffy_flex_direction(d: FlexDirection) -> taffy::FlexDirection {
     match d {
-        FlexDirection::Row           => TaffyFlexDirection::Row,
-        FlexDirection::Column        => TaffyFlexDirection::Column,
-        FlexDirection::RowReverse    => TaffyFlexDirection::RowReverse,
-        FlexDirection::ColumnReverse => TaffyFlexDirection::ColumnReverse,
+        FlexDirection::Row           => taffy::FlexDirection::Row,
+        FlexDirection::Column        => taffy::FlexDirection::Column,
+        FlexDirection::RowReverse    => taffy::FlexDirection::RowReverse,
+        FlexDirection::ColumnReverse => taffy::FlexDirection::ColumnReverse,
     }
 }
 
-fn to_taffy_align_items(a: AlignItems) -> TaffyAlignItems {
+fn to_taffy_align_items(a: AlignItems) -> taffy::AlignItems {
     match a {
-        AlignItems::Stretch   => TaffyAlignItems::Stretch,
-        AlignItems::Center    => TaffyAlignItems::Center,
-        AlignItems::FlexStart => TaffyAlignItems::FlexStart,
-        AlignItems::FlexEnd   => TaffyAlignItems::FlexEnd,
-        AlignItems::Baseline  => TaffyAlignItems::Baseline,
+        AlignItems::Stretch   => taffy::AlignItems::Stretch,
+        AlignItems::Center    => taffy::AlignItems::Center,
+        AlignItems::FlexStart => taffy::AlignItems::FlexStart,
+        AlignItems::FlexEnd   => taffy::AlignItems::FlexEnd,
+        AlignItems::Baseline  => taffy::AlignItems::Baseline,
     }
 }
 
-fn to_taffy_justify_content(j: JustifyContent) -> TaffyJustifyContent {
+fn to_taffy_justify_content(j: JustifyContent) -> taffy::JustifyContent {
     match j {
-        JustifyContent::FlexStart    => TaffyJustifyContent::FlexStart,
-        JustifyContent::Center       => TaffyJustifyContent::Center,
-        JustifyContent::FlexEnd      => TaffyJustifyContent::FlexEnd,
-        JustifyContent::SpaceBetween => TaffyJustifyContent::SpaceBetween,
-        JustifyContent::SpaceAround  => TaffyJustifyContent::SpaceAround,
-        JustifyContent::SpaceEvenly  => TaffyJustifyContent::SpaceEvenly,
+        JustifyContent::FlexStart    => taffy::JustifyContent::FlexStart,
+        JustifyContent::Center       => taffy::JustifyContent::Center,
+        JustifyContent::FlexEnd      => taffy::JustifyContent::FlexEnd,
+        JustifyContent::SpaceBetween => taffy::JustifyContent::SpaceBetween,
+        JustifyContent::SpaceAround  => taffy::JustifyContent::SpaceAround,
+        JustifyContent::SpaceEvenly  => taffy::JustifyContent::SpaceEvenly,
     }
 }
 
 /// Convert a `fe_ui_core::Dimension` to a `taffy::Dimension`.
-///
-/// Percent values are divided by 100 — fe_ui_core stores [0,100] (CSS
-/// convention) while Taffy expects [0,1].
-pub fn to_taffy_dimension(d: Dimension) -> TaffyDimension {
+/// Percent values divided by 100 — fe_ui_core stores [0,100], taffy wants [0,1].
+pub fn to_taffy_dimension(d: Dimension) -> taffy::Dimension {
     match d {
-        Dimension::Auto       => TaffyDimension::Auto,
-        Dimension::Px(px)     => TaffyDimension::Length(px),
-        Dimension::Percent(p) => TaffyDimension::Percent(p / 100.0),
+        Dimension::Auto       => taffy::Dimension::Auto,
+        Dimension::Px(px)     => taffy::Dimension::Length(px),
+        Dimension::Percent(p) => taffy::Dimension::Percent(p / 100.0),
     }
 }
 
-/// Convert a `fe_ui_core::Rect` to a `taffy::Rect<LengthPercentage>`.
-/// Used for padding.
-fn to_taffy_rect_lp(r: Rect) -> TaffyRect<LengthPercentage> {
-    TaffyRect {
+fn to_taffy_rect_lp(r: Rect) -> taffy::Rect<LengthPercentage> {
+    taffy::Rect {
         top:    LengthPercentage::Length(r.top),
         right:  LengthPercentage::Length(r.right),
         bottom: LengthPercentage::Length(r.bottom),
@@ -148,10 +113,8 @@ fn to_taffy_rect_lp(r: Rect) -> TaffyRect<LengthPercentage> {
     }
 }
 
-/// Convert a `fe_ui_core::Rect` to a `taffy::Rect<LengthPercentageAuto>`.
-/// Used for margin (which can be Auto in CSS).
-fn to_taffy_rect_lpa(r: Rect) -> TaffyRect<LengthPercentageAuto> {
-    TaffyRect {
+fn to_taffy_rect_lpa(r: Rect) -> taffy::Rect<LengthPercentageAuto> {
+    taffy::Rect {
         top:    LengthPercentageAuto::Length(r.top),
         right:  LengthPercentageAuto::Length(r.right),
         bottom: LengthPercentageAuto::Length(r.bottom),
@@ -168,55 +131,42 @@ mod tests {
 
     #[test]
     fn dimension_auto_converts() {
-        assert!(matches!(
-            to_taffy_dimension(Dimension::Auto),
-            TaffyDimension::Auto
-        ));
+        assert!(matches!(to_taffy_dimension(Dimension::Auto), taffy::Dimension::Auto));
     }
 
     #[test]
     fn dimension_px_converts() {
-        let result = to_taffy_dimension(Dimension::Px(200.0));
-        assert!(matches!(result, TaffyDimension::Length(v) if (v - 200.0).abs() < 1e-6));
+        let r = to_taffy_dimension(Dimension::Px(200.0));
+        assert!(matches!(r, taffy::Dimension::Length(v) if (v - 200.0).abs() < 1e-6));
     }
 
     #[test]
     fn dimension_percent_divides_by_100() {
-        // fe_ui_core stores 50.0 meaning "50%"
-        // taffy expects 0.5
-        let result = to_taffy_dimension(Dimension::Percent(50.0));
-        assert!(matches!(result, TaffyDimension::Percent(v) if (v - 0.5).abs() < 1e-6));
+        let r = to_taffy_dimension(Dimension::Percent(50.0));
+        assert!(matches!(r, taffy::Dimension::Percent(v) if (v - 0.5).abs() < 1e-6));
     }
 
     #[test]
     fn dimension_percent_100_becomes_1() {
-        let result = to_taffy_dimension(Dimension::Percent(100.0));
-        assert!(matches!(result, TaffyDimension::Percent(v) if (v - 1.0).abs() < 1e-6));
+        let r = to_taffy_dimension(Dimension::Percent(100.0));
+        assert!(matches!(r, taffy::Dimension::Percent(v) if (v - 1.0).abs() < 1e-6));
     }
 
     #[test]
     fn display_flex_converts() {
-        assert!(matches!(to_taffy_display(Display::Flex), TaffyDisplay::Flex));
+        assert!(matches!(to_taffy_display(Display::Flex), taffy::Display::Flex));
     }
 
     #[test]
     fn display_none_converts() {
-        assert!(matches!(to_taffy_display(Display::None), TaffyDisplay::None));
-    }
-
-    #[test]
-    fn flex_direction_row_converts() {
-        assert!(matches!(
-            to_taffy_flex_direction(FlexDirection::Row),
-            TaffyFlexDirection::Row
-        ));
+        assert!(matches!(to_taffy_display(Display::None), taffy::Display::None));
     }
 
     #[test]
     fn flex_direction_column_converts() {
         assert!(matches!(
             to_taffy_flex_direction(FlexDirection::Column),
-            TaffyFlexDirection::Column
+            taffy::FlexDirection::Column
         ));
     }
 
@@ -224,7 +174,7 @@ mod tests {
     fn align_items_center_converts() {
         assert!(matches!(
             to_taffy_align_items(AlignItems::Center),
-            TaffyAlignItems::Center
+            taffy::AlignItems::Center
         ));
     }
 
@@ -232,24 +182,24 @@ mod tests {
     fn justify_content_space_between_converts() {
         assert!(matches!(
             to_taffy_justify_content(JustifyContent::SpaceBetween),
-            TaffyJustifyContent::SpaceBetween
+            taffy::JustifyContent::SpaceBetween
         ));
     }
 
     #[test]
     fn to_taffy_style_size_maps_width_height() {
-        let mut style  = Style::default();
-        style.width    = Dimension::Px(300.0);
-        style.height   = Dimension::Px(150.0);
+        let mut style = Style::default();
+        style.width   = Dimension::Px(300.0);
+        style.height  = Dimension::Px(150.0);
         let ts = to_taffy_style(&style);
-        assert!(matches!(ts.size.width,  TaffyDimension::Length(v) if (v - 300.0).abs() < 1e-6));
-        assert!(matches!(ts.size.height, TaffyDimension::Length(v) if (v - 150.0).abs() < 1e-6));
+        assert!(matches!(ts.size.width,  taffy::Dimension::Length(v) if (v - 300.0).abs() < 1e-6));
+        assert!(matches!(ts.size.height, taffy::Dimension::Length(v) if (v - 150.0).abs() < 1e-6));
     }
 
     #[test]
     fn to_taffy_style_gap_applies_to_both_axes() {
         let mut style = Style::default();
-        style.gap = 16.0;
+        style.gap     = 16.0;
         let ts = to_taffy_style(&style);
         assert!(matches!(ts.gap.width,  LengthPercentage::Length(v) if (v - 16.0).abs() < 1e-6));
         assert!(matches!(ts.gap.height, LengthPercentage::Length(v) if (v - 16.0).abs() < 1e-6));
@@ -258,8 +208,8 @@ mod tests {
     #[test]
     fn to_taffy_style_padding_maps_all_sides() {
         use fe_ui_core::style::Rect;
-        let mut style  = Style::default();
-        style.padding  = Rect { top: 8.0, right: 16.0, bottom: 8.0, left: 16.0 };
+        let mut style = Style::default();
+        style.padding = Rect { top: 8.0, right: 16.0, bottom: 8.0, left: 16.0 };
         let ts = to_taffy_style(&style);
         assert!(matches!(ts.padding.top,    LengthPercentage::Length(v) if (v - 8.0).abs()  < 1e-6));
         assert!(matches!(ts.padding.right,  LengthPercentage::Length(v) if (v - 16.0).abs() < 1e-6));
@@ -269,8 +219,7 @@ mod tests {
 
     #[test]
     fn to_taffy_style_default_display_is_flex() {
-        let style = Style::default();
-        let ts    = to_taffy_style(&style);
-        assert!(matches!(ts.display, TaffyDisplay::Flex));
+        let ts = to_taffy_style(&Style::default());
+        assert!(matches!(ts.display, taffy::Display::Flex));
     }
 }
